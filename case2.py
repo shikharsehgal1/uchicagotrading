@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
+from sklearn.covariance import LedoitWolf
 
 N_ASSETS = 25
 TICKS_PER_DAY = 30
@@ -44,13 +45,41 @@ def safe_weights(w: np.ndarray) -> np.ndarray:
         w /= gross
     return w
 
+def intraday_realized_vol(tick_prices: np.ndarray, n_days: int = 21) -> np.ndarray:
+    """EWMA-smoothed realized vol from 30 intraday ticks per day."""
+    n_ticks = tick_prices.shape[0]
+    total_days = n_ticks // TICKS_PER_DAY
+    start_day = max(0, total_days - n_days)
+    daily_rvars = []
+    for d in range(start_day, total_days):
+        t0 = d * TICKS_PER_DAY
+        day_p = tick_prices[t0:t0 + TICKS_PER_DAY]
+        if day_p.shape[0] < 2:
+            continue
+        intra_rets = np.diff(np.log(day_p), axis=0)
+        daily_rvars.append(np.sum(intra_rets**2, axis=0))
+    if len(daily_rvars) == 0:
+        return np.ones(tick_prices.shape[1]) * 0.15
+    rvars = np.array(daily_rvars)
+    lam = 0.94
+    ewma = rvars[0].copy()
+    for i in range(1, len(rvars)):
+        ewma = lam * ewma + (1 - lam) * rvars[i]
+    return np.sqrt(np.maximum(ewma, 1e-10) * 252)
+
+
 class MyStrategy(StrategyBase):
-    """Exact reproduction of the 1.44 Sharpe version."""
+    """
+    Sector momentum + intraday realized vol + Ledoit-Wolf vol targeting.
+    
+    Confirmed best configuration after testing PAMR, B-L, HRP, partial
+    rebalancing, and multiple signal combinations.
+    """
+
     REBAL_EVERY = 5
     SEC_MOM_FAST = 21
     SEC_MOM_SLOW = 63
     MOM_BLEND = 0.6
-    VOL_WIN = 42
     VOL_TARGET = 0.14
     SHORT_THRESHOLD = -0.02
 
@@ -82,7 +111,7 @@ class MyStrategy(StrategyBase):
         if not np.all(np.isfinite(rets)):
             return safe_weights(self.prev_weights.copy())
 
-        # Blended sector momentum (fast 21d + slow 63d)
+        # === BLENDED SECTOR MOMENTUM ===
         sec_mom = {}
         for s in range(self.n_sectors):
             mask = self.sectors == s
@@ -92,7 +121,6 @@ class MyStrategy(StrategyBase):
 
         ranked = sorted(sec_mom.keys(), key=lambda s: sec_mom[s], reverse=True)
 
-        # Adaptive shorting
         worst_mom = sec_mom[ranked[-1]]
         if worst_mom < self.SHORT_THRESHOLD:
             allocs = {ranked[0]: 0.38, ranked[1]: 0.28,
@@ -101,20 +129,18 @@ class MyStrategy(StrategyBase):
             allocs = {ranked[0]: 0.38, ranked[1]: 0.28,
                       ranked[2]: 0.16, ranked[3]: 0.10, ranked[4]: 0.08}
 
-        # Within sector: inv-vol * cost discount
-        weights = np.zeros(N_ASSETS)
-        recent = rets[-self.VOL_WIN:]
+        # === WITHIN-SECTOR: inverse realized vol × cost discount ===
+        rvol = intraday_realized_vol(price_history, n_days=21)
 
+        weights = np.zeros(N_ASSETS)
         for s, alloc in allocs.items():
             idx = np.where(self.sectors == s)[0]
-            vols = np.std(recent[:, idx], axis=0, ddof=1)
-            vols = np.maximum(vols, 1e-8)
-            inv_vol = 1.0 / vols
+            inv_rvol = 1.0 / np.maximum(rvol[idx], 0.01)
             if alloc >= 0:
                 cost_adj = 1.0 / (1.0 + self.spread[idx] * 100)
             else:
                 cost_adj = 1.0 / (1.0 + self.borrow[idx] * 10)
-            w = inv_vol * cost_adj
+            w = inv_rvol * cost_adj
             w_sum = float(np.sum(w))
             if w_sum < 1e-10:
                 w = np.ones(len(idx)) / len(idx)
@@ -122,12 +148,12 @@ class MyStrategy(StrategyBase):
                 w /= w_sum
             weights[idx] = alloc * w
 
-        # Vol targeting (shrunk cov)
+        # === VOL TARGETING (Ledoit-Wolf) ===
         cov_win = min(63, rets.shape[0])
-        cov = np.cov(rets[-cov_win:], rowvar=False)
-        mu = np.trace(cov) / N_ASSETS
-        alpha_shrink = min(1.0, max(0.0, 2.0 / cov_win))
-        cov = (1 - alpha_shrink) * cov + alpha_shrink * mu * np.eye(N_ASSETS)
+        try:
+            cov = LedoitWolf().fit(rets[-cov_win:]).covariance_
+        except Exception:
+            cov = np.cov(rets[-cov_win:], rowvar=False)
 
         port_vol = float(np.sqrt(np.abs(weights @ cov @ weights))) * np.sqrt(252)
         if port_vol > 1e-6:
@@ -136,7 +162,7 @@ class MyStrategy(StrategyBase):
 
         weights = safe_weights(weights)
 
-        # Cost gate
+        # === COST GATE ===
         delta = weights - self.prev_weights
         est_cost = float(np.sum(self.spread / 2 * np.abs(delta))
                          + np.sum(2.5 * self.spread * delta ** 2))
@@ -146,6 +172,7 @@ class MyStrategy(StrategyBase):
         self.prev_weights = weights.copy()
         self.last_rebal_day = day
         return weights
+
 
 def create_strategy() -> StrategyBase:
     return MyStrategy()
