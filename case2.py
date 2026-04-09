@@ -46,7 +46,6 @@ def safe_weights(w: np.ndarray) -> np.ndarray:
     return w
 
 def intraday_realized_vol(tick_prices: np.ndarray, n_days: int = 21) -> np.ndarray:
-    """EWMA-smoothed realized vol from 30 intraday ticks per day."""
     n_ticks = tick_prices.shape[0]
     total_days = n_ticks // TICKS_PER_DAY
     start_day = max(0, total_days - n_days)
@@ -69,19 +68,14 @@ def intraday_realized_vol(tick_prices: np.ndarray, n_days: int = 21) -> np.ndarr
 
 
 class MyStrategy(StrategyBase):
-    """
-    Sector momentum + intraday realized vol + Ledoit-Wolf vol targeting.
-    
-    Confirmed best configuration after testing PAMR, B-L, HRP, partial
-    rebalancing, and multiple signal combinations.
-    """
+    """Black-Litterman inspired: soft momentum tilts on EW prior."""
 
     REBAL_EVERY = 5
     SEC_MOM_FAST = 21
     SEC_MOM_SLOW = 63
     MOM_BLEND = 0.6
-    VOL_TARGET = 0.14
-    SHORT_THRESHOLD = -0.02
+    VOL_TARGET = 0.12
+    TAU = 0.11
 
     def fit(self, train_prices: np.ndarray, meta: PublicMeta, **kwargs) -> None:
         self.spread = meta.spread_bps / 1e4
@@ -111,62 +105,83 @@ class MyStrategy(StrategyBase):
         if not np.all(np.isfinite(rets)):
             return safe_weights(self.prev_weights.copy())
 
-        # === BLENDED SECTOR MOMENTUM ===
-        sec_mom = {}
-        for s in range(self.n_sectors):
-            mask = self.sectors == s
-            fast = float(np.mean(np.sum(rets[-self.SEC_MOM_FAST:, mask], axis=0)))
-            slow = float(np.mean(np.sum(rets[-self.SEC_MOM_SLOW:, mask], axis=0)))
-            sec_mom[s] = self.MOM_BLEND * fast + (1 - self.MOM_BLEND) * slow
-
-        ranked = sorted(sec_mom.keys(), key=lambda s: sec_mom[s], reverse=True)
-
-        worst_mom = sec_mom[ranked[-1]]
-        if worst_mom < self.SHORT_THRESHOLD:
-            allocs = {ranked[0]: 0.38, ranked[1]: 0.28,
-                      ranked[2]: 0.16, ranked[3]: 0.10, ranked[4]: -0.08}
-        else:
-            allocs = {ranked[0]: 0.38, ranked[1]: 0.28,
-                      ranked[2]: 0.16, ranked[3]: 0.10, ranked[4]: 0.08}
-
-        # === WITHIN-SECTOR: inverse realized vol × cost discount ===
-        rvol = intraday_realized_vol(price_history, n_days=21)
-
-        weights = np.zeros(N_ASSETS)
-        for s, alloc in allocs.items():
-            idx = np.where(self.sectors == s)[0]
-            inv_rvol = 1.0 / np.maximum(rvol[idx], 0.01)
-            if alloc >= 0:
-                cost_adj = 1.0 / (1.0 + self.spread[idx] * 100)
-            else:
-                cost_adj = 1.0 / (1.0 + self.borrow[idx] * 10)
-            w = inv_rvol * cost_adj
-            w_sum = float(np.sum(w))
-            if w_sum < 1e-10:
-                w = np.ones(len(idx)) / len(idx)
-            else:
-                w /= w_sum
-            weights[idx] = alloc * w
-
-        # === VOL TARGETING (Ledoit-Wolf) ===
+        # Ledoit-Wolf covariance
         cov_win = min(63, rets.shape[0])
         try:
             cov = LedoitWolf().fit(rets[-cov_win:]).covariance_
         except Exception:
             cov = np.cov(rets[-cov_win:], rowvar=False)
 
+        # === BLACK-LITTERMAN INSPIRED APPROACH ===
+        # Prior: equal-weight equilibrium
+        w_eq = np.ones(N_ASSETS) / N_ASSETS
+        risk_aversion = 3.0
+        pi = risk_aversion * cov @ w_eq  # implied equilibrium returns
+
+        # Views: sector momentum as views on sector-level returns
+        # Each sector view: "sector s will return X"
+        sec_views = {}
+        for s in range(self.n_sectors):
+            mask = self.sectors == s
+            fast = float(np.mean(np.sum(rets[-self.SEC_MOM_FAST:, mask], axis=0)))
+            slow = float(np.mean(np.sum(rets[-self.SEC_MOM_SLOW:, mask], axis=0)))
+            sec_views[s] = self.MOM_BLEND * fast + (1 - self.MOM_BLEND) * slow
+
+        # Convert sector views to asset-level expected return adjustments
+        # B-L: E[R] = pi + tau*Sigma*P'*(P*tau*Sigma*P' + Omega)^-1 * (Q - P*pi)
+        # Simplified: tilt proportional to (view - equilibrium) scaled by confidence
+        view_signal = np.zeros(N_ASSETS)
+        for s in range(self.n_sectors):
+            mask = self.sectors == s
+            # z-score the sector momentum
+            view_signal[mask] = sec_views[s]
+
+        # Normalize view signal
+        vs_std = np.std(view_signal)
+        if vs_std > 1e-8:
+            view_z = (view_signal - np.mean(view_signal)) / vs_std
+        else:
+            view_z = np.zeros(N_ASSETS)
+
+        # B-L posterior weights: prior + tilt proportional to views
+        # tau controls how much we tilt away from prior
+        tilt = self.TAU * view_z
+        
+        # Inverse-vol within sector for granularity
+        rvol = intraday_realized_vol(price_history, n_days=21)
+        inv_rvol = 1.0 / np.maximum(rvol, 0.01)
+        # Normalize inv_rvol within each sector
+        for s in range(self.n_sectors):
+            idx = np.where(self.sectors == s)[0]
+            sector_sum = np.sum(inv_rvol[idx])
+            if sector_sum > 1e-10:
+                inv_rvol[idx] /= sector_sum
+
+        # Cost adjustment
+        cost_adj = 1.0 / (1.0 + self.spread * 100)
+
+        # Combined weight: EW base + momentum tilt, shaped by inv-vol and cost
+        base = 1.0 / N_ASSETS
+        weights = (base + tilt) * inv_rvol * cost_adj
+
+        # Handle negatives for shorting
+        weights = np.where(weights < -0.02, weights, np.maximum(weights, 0.0))
+
+        # Normalize
+        weights = safe_weights(weights)
+
+        # Vol targeting
         port_vol = float(np.sqrt(np.abs(weights @ cov @ weights))) * np.sqrt(252)
         if port_vol > 1e-6:
             vol_scalar = np.clip(self.VOL_TARGET / port_vol, 0.3, 1.5)
             weights *= vol_scalar
-
         weights = safe_weights(weights)
 
-        # === COST GATE ===
+        # Cost gate
         delta = weights - self.prev_weights
         est_cost = float(np.sum(self.spread / 2 * np.abs(delta))
                          + np.sum(2.5 * self.spread * delta ** 2))
-        if est_cost < 0.0005 and day > 0:
+        if est_cost < 0.0004 and day > 0:
             return self.prev_weights
 
         self.prev_weights = weights.copy()
