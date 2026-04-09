@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from case2 import N_ASSETS, PublicMeta, StrategyBase, daily_close, safe_weights
+from case2 import N_ASSETS, PublicMeta, StrategyBase
+from pfo.data_pipeline import daily_closes_from_ticks as daily_close
+from pfo.strategy import safe_weights
 
 TRADING_DAYS_PER_YEAR = 252
 

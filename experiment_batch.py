@@ -19,8 +19,8 @@ from collections.abc import Callable
 
 import numpy as np
 
-from benchmarks import EqualWeightStrategy
-from case2 import MyStrategy, create_strategy_with_params, load_meta, load_prices
+from benchmarks import EqualWeightStrategy, VolManagedEqualWeightStrategy
+from case2 import MyStrategy, load_meta, load_prices
 from harness import cv_folds, run_backtest, summarize_result
 
 LAMBDA_STD = 0.5
@@ -64,20 +64,11 @@ def main() -> None:
     prices = load_prices(os.path.join(args.data_dir, "prices.csv"))
     meta = load_meta(os.path.join(args.data_dir, "meta.csv"))
 
+    # pfo architecture: component ablations live in code modules, not instance flags.
     experiments: list[tuple[str, Callable[[], object]]] = [
         ("equal_weight", lambda: EqualWeightStrategy()),
-        ("A_baseline_tuned", lambda: MyStrategy()),
-        ("B_no_sector_momentum", lambda: create_strategy_with_params(FEATURE_SECTOR_MOMENTUM=False)),
-        ("C_no_inv_vol_within_sector", lambda: create_strategy_with_params(FEATURE_INV_VOL_WITHIN_SECTOR=False)),
-        ("D_no_vol_targeting", lambda: create_strategy_with_params(FEATURE_VOL_TARGETING=False)),
-        ("E_no_cost_gate", lambda: create_strategy_with_params(FEATURE_COST_GATE=False)),
-        ("F_sample_cov_only", lambda: create_strategy_with_params(USE_LEDOIT_WOLF=False)),
-        ("G_long_only", lambda: create_strategy_with_params(LONG_ONLY=True)),
-        ("H_slower_rebal_5d", lambda: create_strategy_with_params(REBAL_EVERY=5)),
-        ("I_slower_rebal_8d", lambda: create_strategy_with_params(REBAL_EVERY=8)),
-        ("J_cost_gate_always_trade", lambda: create_strategy_with_params(COST_GATE_THRESHOLD=0.0)),
-        ("K_weaker_tilt_tau008", lambda: create_strategy_with_params(TAU=0.08)),
-        ("L_stronger_tilt_tau16", lambda: create_strategy_with_params(TAU=0.16)),
+        ("vol_managed_ew", lambda: VolManagedEqualWeightStrategy()),
+        ("pfo_systematic", lambda: MyStrategy()),
     ]
 
     rows: list[tuple[str, dict]] = []
