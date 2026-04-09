@@ -1,5 +1,7 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 from sklearn.covariance import LedoitWolf
@@ -8,15 +10,25 @@ N_ASSETS = 25
 TICKS_PER_DAY = 30
 ASSET_COLUMNS = tuple(f"A{i:02d}" for i in range(N_ASSETS))
 
+# Ablation toggles for research (defaults match original submission behavior).
+FEATURE_SECTOR_MOMENTUM = True
+FEATURE_INV_VOL_WITHIN_SECTOR = True
+FEATURE_VOL_TARGETING = True
+FEATURE_COST_GATE = True
+USE_LEDOIT_WOLF = True
+
+
 @dataclass(frozen=True)
 class PublicMeta:
     sector_id: np.ndarray
     spread_bps: np.ndarray
     borrow_bps_annual: np.ndarray
 
+
 def load_prices(path: str = "prices.csv") -> np.ndarray:
     df = pd.read_csv(path, index_col="tick")
     return df[list(ASSET_COLUMNS)].to_numpy(dtype=float)
+
 
 def load_meta(path: str = "meta.csv") -> PublicMeta:
     df = pd.read_csv(path)
@@ -26,17 +38,21 @@ def load_meta(path: str = "meta.csv") -> PublicMeta:
         borrow_bps_annual=df["borrow_bps_annual"].to_numpy(dtype=float),
     )
 
+
 class StrategyBase:
     def fit(self, train_prices: np.ndarray, meta: PublicMeta, **kwargs) -> None:
         pass
+
     def get_weights(self, price_history: np.ndarray, meta: PublicMeta, day: int) -> np.ndarray:
         raise NotImplementedError
+
 
 def daily_close(tick_prices: np.ndarray) -> np.ndarray:
     n = tick_prices.shape[0] // TICKS_PER_DAY
     if n == 0:
         return tick_prices[:1]
     return tick_prices[TICKS_PER_DAY - 1 : n * TICKS_PER_DAY : TICKS_PER_DAY]
+
 
 def safe_weights(w: np.ndarray) -> np.ndarray:
     w = np.where(np.isfinite(w), w, 0.0)
@@ -45,6 +61,7 @@ def safe_weights(w: np.ndarray) -> np.ndarray:
         w /= gross
     return w
 
+
 def intraday_realized_vol(tick_prices: np.ndarray, n_days: int = 21) -> np.ndarray:
     n_ticks = tick_prices.shape[0]
     total_days = n_ticks // TICKS_PER_DAY
@@ -52,7 +69,7 @@ def intraday_realized_vol(tick_prices: np.ndarray, n_days: int = 21) -> np.ndarr
     daily_rvars = []
     for d in range(start_day, total_days):
         t0 = d * TICKS_PER_DAY
-        day_p = tick_prices[t0:t0 + TICKS_PER_DAY]
+        day_p = tick_prices[t0 : t0 + TICKS_PER_DAY]
         if day_p.shape[0] < 2:
             continue
         intra_rets = np.diff(np.log(day_p), axis=0)
@@ -70,12 +87,17 @@ def intraday_realized_vol(tick_prices: np.ndarray, n_days: int = 21) -> np.ndarr
 class MyStrategy(StrategyBase):
     """Black-Litterman inspired: soft momentum tilts on EW prior."""
 
-    REBAL_EVERY = 5
+    # Defaults chosen by coarse CV on the released training CSV (tune_cv.py, robust score).
+    REBAL_EVERY = 3
     SEC_MOM_FAST = 21
     SEC_MOM_SLOW = 63
-    MOM_BLEND = 0.6
+    MOM_BLEND = 0.65
     VOL_TARGET = 0.12
-    TAU = 0.11
+    TAU = 0.13
+    LONG_ONLY = False
+    COST_GATE_THRESHOLD = 0.0004
+    # Rolling length (days) for smoothing daily log-returns used only in sector momentum; 0 = off.
+    MOM_SMOOTH_DAYS = 0
 
     def fit(self, train_prices: np.ndarray, meta: PublicMeta, **kwargs) -> None:
         self.spread = meta.spread_bps / 1e4
@@ -91,6 +113,85 @@ class MyStrategy(StrategyBase):
         except Exception:
             return safe_weights(self.prev_weights.copy())
 
+    def _estimate_cov(self, rets: np.ndarray) -> np.ndarray:
+        cov_win = min(63, rets.shape[0])
+        window = rets[-cov_win:]
+        use_lw = getattr(self, "USE_LEDOIT_WOLF", USE_LEDOIT_WOLF)
+        if use_lw:
+            try:
+                return LedoitWolf().fit(window).covariance_
+            except Exception:
+                pass
+        return np.cov(window, rowvar=False)
+
+    def _momentum_input_rets(self, rets: np.ndarray) -> np.ndarray:
+        w = int(getattr(self, "MOM_SMOOTH_DAYS", self.MOM_SMOOTH_DAYS) or 0)
+        if w <= 1 or rets.shape[0] < w:
+            return rets
+        t, n = rets.shape
+        c = np.concatenate([np.zeros((1, n), dtype=rets.dtype), np.cumsum(rets, axis=0)], axis=0)
+        out = np.empty_like(rets)
+        out[: w - 1] = rets[: w - 1]
+        out[w - 1 :] = (c[w:] - c[:-w]) / float(w)
+        return out
+
+    def _sector_momentum_view_z(self, rets: np.ndarray) -> np.ndarray:
+        if not getattr(self, "FEATURE_SECTOR_MOMENTUM", FEATURE_SECTOR_MOMENTUM):
+            return np.zeros(N_ASSETS)
+
+        rets_m = self._momentum_input_rets(rets)
+        sec_views: dict[int, float] = {}
+        for s in range(self.n_sectors):
+            mask = self.sectors == s
+            fast = float(np.mean(np.sum(rets_m[-self.SEC_MOM_FAST :, mask], axis=0)))
+            slow = float(np.mean(np.sum(rets_m[-self.SEC_MOM_SLOW :, mask], axis=0)))
+            sec_views[s] = self.MOM_BLEND * fast + (1 - self.MOM_BLEND) * slow
+
+        view_signal = np.zeros(N_ASSETS)
+        for s in range(self.n_sectors):
+            mask = self.sectors == s
+            view_signal[mask] = sec_views[s]
+
+        vs_std = np.std(view_signal)
+        if vs_std > 1e-8:
+            return (view_signal - np.mean(view_signal)) / vs_std
+        return np.zeros(N_ASSETS)
+
+    def _inv_vol_within_sector(self, price_history: np.ndarray) -> np.ndarray:
+        if not getattr(self, "FEATURE_INV_VOL_WITHIN_SECTOR", FEATURE_INV_VOL_WITHIN_SECTOR):
+            inv_rvol = np.ones(N_ASSETS)
+        else:
+            rvol = intraday_realized_vol(price_history, n_days=21)
+            inv_rvol = 1.0 / np.maximum(rvol, 0.01)
+
+        for s in range(self.n_sectors):
+            idx = np.where(self.sectors == s)[0]
+            sector_sum = np.sum(inv_rvol[idx])
+            if sector_sum > 1e-10:
+                inv_rvol[idx] /= sector_sum
+        return inv_rvol
+
+    def _apply_vol_target(self, weights: np.ndarray, cov: np.ndarray) -> np.ndarray:
+        if not getattr(self, "FEATURE_VOL_TARGETING", FEATURE_VOL_TARGETING):
+            return weights
+        port_vol = float(np.sqrt(np.abs(weights @ cov @ weights))) * np.sqrt(252)
+        if port_vol > 1e-6:
+            vol_scalar = np.clip(self.VOL_TARGET / port_vol, 0.3, 1.5)
+            weights = weights * vol_scalar
+        return safe_weights(weights)
+
+    def _maybe_skip_rebalance_for_cost(self, weights: np.ndarray, day: int) -> np.ndarray | None:
+        if not getattr(self, "FEATURE_COST_GATE", FEATURE_COST_GATE):
+            return None
+        delta = weights - self.prev_weights
+        est_cost = float(
+            np.sum(self.spread / 2 * np.abs(delta)) + np.sum(2.5 * self.spread * delta**2)
+        )
+        thr = float(getattr(self, "COST_GATE_THRESHOLD", self.COST_GATE_THRESHOLD))
+        if est_cost < thr and day > 0:
+            return self.prev_weights
+        return None
+
     def _compute_weights(self, price_history: np.ndarray, meta: PublicMeta, day: int) -> np.ndarray:
         if day - self.last_rebal_day < self.REBAL_EVERY and day > 0:
             return self.prev_weights
@@ -105,84 +206,28 @@ class MyStrategy(StrategyBase):
         if not np.all(np.isfinite(rets)):
             return safe_weights(self.prev_weights.copy())
 
-        # Ledoit-Wolf covariance
-        cov_win = min(63, rets.shape[0])
-        try:
-            cov = LedoitWolf().fit(rets[-cov_win:]).covariance_
-        except Exception:
-            cov = np.cov(rets[-cov_win:], rowvar=False)
+        cov = self._estimate_cov(rets)
 
-        # === BLACK-LITTERMAN INSPIRED APPROACH ===
-        # Prior: equal-weight equilibrium
-        w_eq = np.ones(N_ASSETS) / N_ASSETS
-        risk_aversion = 3.0
-        pi = risk_aversion * cov @ w_eq  # implied equilibrium returns
-
-        # Views: sector momentum as views on sector-level returns
-        # Each sector view: "sector s will return X"
-        sec_views = {}
-        for s in range(self.n_sectors):
-            mask = self.sectors == s
-            fast = float(np.mean(np.sum(rets[-self.SEC_MOM_FAST:, mask], axis=0)))
-            slow = float(np.mean(np.sum(rets[-self.SEC_MOM_SLOW:, mask], axis=0)))
-            sec_views[s] = self.MOM_BLEND * fast + (1 - self.MOM_BLEND) * slow
-
-        # Convert sector views to asset-level expected return adjustments
-        # B-L: E[R] = pi + tau*Sigma*P'*(P*tau*Sigma*P' + Omega)^-1 * (Q - P*pi)
-        # Simplified: tilt proportional to (view - equilibrium) scaled by confidence
-        view_signal = np.zeros(N_ASSETS)
-        for s in range(self.n_sectors):
-            mask = self.sectors == s
-            # z-score the sector momentum
-            view_signal[mask] = sec_views[s]
-
-        # Normalize view signal
-        vs_std = np.std(view_signal)
-        if vs_std > 1e-8:
-            view_z = (view_signal - np.mean(view_signal)) / vs_std
-        else:
-            view_z = np.zeros(N_ASSETS)
-
-        # B-L posterior weights: prior + tilt proportional to views
-        # tau controls how much we tilt away from prior
+        view_z = self._sector_momentum_view_z(rets)
         tilt = self.TAU * view_z
-        
-        # Inverse-vol within sector for granularity
-        rvol = intraday_realized_vol(price_history, n_days=21)
-        inv_rvol = 1.0 / np.maximum(rvol, 0.01)
-        # Normalize inv_rvol within each sector
-        for s in range(self.n_sectors):
-            idx = np.where(self.sectors == s)[0]
-            sector_sum = np.sum(inv_rvol[idx])
-            if sector_sum > 1e-10:
-                inv_rvol[idx] /= sector_sum
 
-        # Cost adjustment
+        inv_rvol = self._inv_vol_within_sector(price_history)
         cost_adj = 1.0 / (1.0 + self.spread * 100)
 
-        # Combined weight: EW base + momentum tilt, shaped by inv-vol and cost
         base = 1.0 / N_ASSETS
         weights = (base + tilt) * inv_rvol * cost_adj
 
-        # Handle negatives for shorting
-        weights = np.where(weights < -0.02, weights, np.maximum(weights, 0.0))
-
-        # Normalize
+        if getattr(self, "LONG_ONLY", False):
+            weights = np.maximum(weights, 0.0)
+        else:
+            weights = np.where(weights < -0.02, weights, np.maximum(weights, 0.0))
         weights = safe_weights(weights)
 
-        # Vol targeting
-        port_vol = float(np.sqrt(np.abs(weights @ cov @ weights))) * np.sqrt(252)
-        if port_vol > 1e-6:
-            vol_scalar = np.clip(self.VOL_TARGET / port_vol, 0.3, 1.5)
-            weights *= vol_scalar
-        weights = safe_weights(weights)
+        weights = self._apply_vol_target(weights, cov)
 
-        # Cost gate
-        delta = weights - self.prev_weights
-        est_cost = float(np.sum(self.spread / 2 * np.abs(delta))
-                         + np.sum(2.5 * self.spread * delta ** 2))
-        if est_cost < 0.0004 and day > 0:
-            return self.prev_weights
+        skip = self._maybe_skip_rebalance_for_cost(weights, day)
+        if skip is not None:
+            return skip
 
         self.prev_weights = weights.copy()
         self.last_rebal_day = day
@@ -191,3 +236,11 @@ class MyStrategy(StrategyBase):
 
 def create_strategy() -> StrategyBase:
     return MyStrategy()
+
+
+def create_strategy_with_params(**params: object) -> StrategyBase:
+    """Instantiate ``MyStrategy`` with instance-level overrides (for CV tuning)."""
+    s = MyStrategy()
+    for k, v in params.items():
+        setattr(s, k, v)
+    return s
