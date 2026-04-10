@@ -4,7 +4,18 @@
       "Bash(pip3 show:*)",
       "Bash(pip3 install:*)",
       "Bash(python3:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(venv/bin/python \"Stock C Bot/stock_c_logic.py\")",
+      "Bash(/Users/robiarpaio/Desktop/uchicagotrading/venv/bin/python:*)",
+      "Bash(/opt/homebrew/bin/python3:*)",
+      "Bash(/opt/homebrew/bin/python3.11 -m venv /Users/robiarpaio/Desktop/uchicagotrading/venv311)",
+      "Bash(/Users/robiarpaio/Desktop/uchicagotrading/venv311/bin/python -m pip install --quiet --upgrade pip)",
+      "Bash(/Users/robiarpaio/Desktop/uchicagotrading/venv311/bin/pip install:*)",
+      "Bash(/Users/robiarpaio/Desktop/uchicagotrading/venv311/bin/python:*)",
+      "Bash(/Users/robiarpaio/Desktop/uchicagotrading/venv311/bin/pip show:*)",
+      "Bash(ls /Users/robiarpaio/Desktop/uchicagotrading/venv/lib/python3.12/site-packages/utcxchangelib*)",
+      "Bash(/Users/robiarpaio/Desktop/uchicagotrading/venv311/bin/pip uninstall:*)",
+      "Bash(cp -r /Users/robiarpaio/Desktop/uchicagotrading/venv/lib/python3.12/site-packages/utcxchangelib /Users/robiarpaio/Desktop/uchicagotrading/venv311/lib/python3.11/site-packages/)"
     ]
   }
 }
