@@ -1,19 +1,14 @@
 import os
-from dotenv import load_dotenv
-load_dotenv()
-print()
-
-
-from typing import Optional
-
-from utcxchangelib import XChangeClient, Side
 import asyncio
+from dotenv import load_dotenv
+from utcxchangelib import XChangeClient
+
+import a_sniper
+
+load_dotenv()
 
 
 class MyXchangeClient(XChangeClient):
-
-    def __init__(self, host: str, username: str, password: str):
-        super().__init__(host, username, password)
 
     async def bot_handle_order_fill(self, order_id: str, qty: int, price: int):
         pass
@@ -24,42 +19,23 @@ class MyXchangeClient(XChangeClient):
     async def bot_handle_book_update(self, symbol: str) -> None:
         pass
 
-
-    async def trade(self):
-        """This is a simple example bot that places orders and prints updates."""
-        await asyncio.sleep(5)
-
-        # You can also look at order books like this
-        for security, book in self.order_books.items():
-            if book.bids or book.asks:
-                sorted_bids = sorted((k,v) for k,v in book.bids.items() if v != 0)
-                sorted_asks = sorted((k,v) for k,v in book.asks.items() if v != 0)
-                print(f"Bids for {security}:\n{sorted_bids}")
-                print(f"Asks for {security}:\n{sorted_asks}")
-
     async def start(self):
-        asyncio.create_task(self.trade())
+        asyncio.create_task(a_sniper.trade(self))
         await self.connect()
-
-def require_env(name: str) -> str:
-    """Return the environment variable `name` or raise a clear error.
-
-    This keeps environment access centralized and delays failure until the
-    value is actually required.
-    """
-    val = os.environ.get(name)
-    if val is None:
-        raise RuntimeError(f"Environment variable '{name}' is required")
-    return val
 
 
 async def main():
-    SERVER = require_env('server')
-    USER = require_env('user')
-    PASSWORD = require_env('password')
-    my_client = MyXchangeClient(SERVER, USER, PASSWORD)
-    print(f"Connecting to {SERVER} as {USER}")
-    await my_client.start()
+    server = os.environ["server"]
+    user = os.environ["user"]
+    password = os.environ["password"]
+    while True:
+        try:
+            print(f"Connecting to {server} as {user}...")
+            client = MyXchangeClient(server, user, password)
+            await client.start()
+        except Exception as e:
+            print(f"Connection lost: {e}. Reconnecting in 5s...")
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
