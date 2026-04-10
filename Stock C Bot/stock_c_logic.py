@@ -15,13 +15,8 @@ lam = 0.65
 beta_y = 1.0
 gamma = 0.5
 
-# CPI-surprise → prob-market sizing buckets (|actual - forecast| in decimal)
-CPI_BUCKETS = [
-    (0.0005, 0),    # noise → no trade
-    (0.0015, 20),   # small surprise
-    (0.0030, 60),   # medium surprise
-    (float("inf"), 120),  # large surprise → full size
-]
+# Reference lot size for the displayed hedge guide
+HEDGE_LOT = 100
 
 # ---- Core Functions ----
 
@@ -94,12 +89,10 @@ if __name__ == "__main__":
 
     SYMBOL = "C"
     PROB_SYMS = ("R_HIKE", "R_HOLD", "R_CUT")
+    WATCHED_SYMS = {SYMBOL, *PROB_SYMS}
 
-    REBALANCE_SEC = 80
-    MAX_ORDER_SIZE = 40
-    MAX_TARGET_POS = 150
-    SIZE_PER_DOLLAR = 20.0
-    MAX_HEDGE_POS = 120
+    HEARTBEAT_SEC = 45      # fallback re-print if nothing moves
+    BOOK_DEBOUNCE_SEC = 1.5 # min gap between book-triggered reprints
     CALIB_MIN_OBS = 25
 
     def _mid(book):
@@ -135,6 +128,10 @@ if __name__ == "__main__":
             self._price_base = None
             self._market_open = True
 
+            # event-driven dashboard
+            self._last_print_ts = 0.0
+            self._print_lock = asyncio.Lock()
+
         def _read_probs(self):
             mids: list[float] = []
             for s in PROB_SYMS:
@@ -159,127 +156,157 @@ if __name__ == "__main__":
 
             try:
                 fv, ops, bonds = fair_value_C(q_h, q_hold_, q_c, self.eps)
-                dpdy, _, _ = dP_dy(q_h, q_hold_, q_c, self.eps)
+                dpdy_tot, dpdy_ops, dpdy_bonds = dP_dy(q_h, q_hold_, q_c, self.eps)
+                gpdy_tot, _, _ = d2P_dy2(q_h, q_hold_, q_c, self.eps)
+                e_dr = expected_rate_change(q_h, q_hold_, q_c)
+                v_dr = variance_rate_change(q_h, q_hold_, q_c)
             finally:
                 gamma, beta_y = g0, b0
 
-            return {"probs": probs, "fv": fv, "dpdy": dpdy}
+            return {
+                "probs": probs,
+                "fv_model": fv,
+                "ops": ops,
+                "bonds": bonds,
+                "dpdy": dpdy_tot,
+                "dpdy_ops": dpdy_ops,
+                "dpdy_bonds": dpdy_bonds,
+                "gpdy": gpdy_tot,
+                "e_dr": e_dr,
+                "var_dr": v_dr,
+            }
 
-        async def _cpi_trade(self, actual: float, forecast: float):
+        def _hedge_for(self, pos_c: int, info: dict) -> tuple[int, int]:
             """
-            Crude CPI-surprise directional trade in the prob market.
-            Hot CPI (actual > forecast) → buy HIKE, sell CUT.
-            Cold CPI (actual < forecast) → sell HIKE, buy CUT.
-            Size by |surprise| via CPI_BUCKETS. Fires on every CPI print.
+            Neutralize C's dP/dy exposure across HIKE and CUT scenarios.
+            Returns (N_hike, N_cut) rounded to ints.
             """
-            surprise = actual - forecast
-            mag = abs(surprise)
+            q_h, q_hold_, q_c = info["probs"]
+            hike_pnl = pos_c * info["dpdy"] * 0.0025   # C P&L if HIKE (+25bps) realizes
+            cut_pnl  = -hike_pnl                       # C P&L if CUT (-25bps) realizes
 
-            # bucketed size (crude if-ladder)
-            size = 0
-            for thresh, sz in CPI_BUCKETS:
-                if mag < thresh:
-                    size = sz
-                    break
+            if q_hold_ <= 1e-6:
+                return 0, 0
 
-            print(
-                f"[CPI] actual={actual:.4f} forecast={forecast:.4f} "
-                f"surprise={surprise:+.4f} → size={size}"
-            )
+            det = q_hold_
+            N_h = (-(1 - q_c) * hike_pnl - q_c * cut_pnl) / det
+            N_c = (-(1 - q_h) * cut_pnl - q_h * hike_pnl) / det
+            return int(round(N_h)), int(round(N_c))
 
-            if size == 0:
+        async def _maybe_print(self, *, reason: str, force: bool = False):
+            """Debounced dashboard print. Force=True bypasses the debounce window."""
+            now = time.monotonic()
+            if not force and (now - self._last_print_ts) < BOOK_DEBOUNCE_SEC:
                 return
-
-            # hot → long HIKE, short CUT.  cold → flip.
-            if surprise > 0:
-                target_hike, target_cut = +size, -size
-            else:
-                target_hike, target_cut = -size, +size
-
-            pos_h = int(self.positions.get("R_HIKE", 0))
-            pos_c = int(self.positions.get("R_CUT", 0))
-
-            print(
-                f"[CPI TRADE] HIKE {pos_h:+d}→{target_hike:+d}   "
-                f"CUT {pos_c:+d}→{target_cut:+d}"
-            )
-
-            # fire both legs concurrently so we hit the book before the rest of the
-            # market re-prices on the same print
-            await asyncio.gather(
-                self._place_toward("R_HIKE", target_hike - pos_h),
-                self._place_toward("R_CUT", target_cut - pos_c),
-            )
-
-        async def _place_toward(self, symbol, delta):
-            if abs(delta) < 1:
+            if self._print_lock.locked():
                 return
+            async with self._print_lock:
+                self._last_print_ts = time.monotonic()
+                await self._print_dashboard(reason)
 
-            book = self.order_books.get(symbol)
-            if not book:
-                return
-
-            bid = max(book.bids.keys(), default=None)
-            ask = min(book.asks.keys(), default=None)
-
-            if delta > 0:
-                px = ask if ask is not None else bid
-                if px is None:
-                    return
-                qty = min(delta, MAX_ORDER_SIZE)
-                await self.place_order(symbol, qty, "buy", int(px))
-                print(f"[ORDER] {symbol} BUY {qty}@{px}")
-            else:
-                px = bid if bid is not None else ask
-                if px is None:
-                    return
-                qty = min(-delta, MAX_ORDER_SIZE)
-                await self.place_order(symbol, qty, "sell", int(px))
-                print(f"[ORDER] {symbol} SELL {qty}@{px}")
-
-        async def _rebalance(self):
+        async def _print_dashboard(self, reason: str = "heartbeat"):
             self.day += 1
             info = self._fair_value()
             c_mid = _mid(self.order_books.get(SYMBOL))
 
             if info is None or c_mid is None:
+                print(f"[TICK {self.day}] skip — book not ready")
                 return
 
             if self._model_base is None:
-                self._model_base = info["fv"]
+                self._model_base = info["fv_model"]
                 self._price_base = c_mid
 
-            fv = self._price_base + (info["fv"] - self._model_base)
+            fv = self._price_base + (info["fv_model"] - self._model_base)
             mis = fv - c_mid
+            q_h, q_hold_, q_c = info["probs"]
+            dpdy = info["dpdy"]
+            dpdy_bp = dpdy * 1e-4  # $ per bp per share
 
-            target = int(np.clip(SIZE_PER_DOLLAR * mis, -MAX_TARGET_POS, MAX_TARGET_POS))
-            pos = int(self.positions.get(SYMBOL, 0))
+            signal = (
+                "CHEAP  (consider LONG)" if mis > 0.5
+                else "RICH   (consider SHORT)" if mis < -0.5
+                else "FAIR   (flat)"
+            )
 
-            print(f"[DAY {self.day}] C mid={c_mid:.2f} fv={fv:.2f} mis={mis:.2f} pos={pos}→{target}")
+            hike_long, cut_long   = self._hedge_for(+HEDGE_LOT, info)
+            hike_short, cut_short = self._hedge_for(-HEDGE_LOT, info)
 
-            await self._place_toward(SYMBOL, target - pos)
+            pos_c_now = int(self.positions.get(SYMBOL, 0))
+            if abs(pos_c_now) > 0:
+                hike_now, cut_now = self._hedge_for(pos_c_now, info)
+                live_line = (
+                    f"  LIVE (pos {pos_c_now:+d} C): HIKE {hike_now:+d}  CUT {cut_now:+d}"
+                )
+            else:
+                live_line = "  LIVE (pos 0): no hedge needed"
+
+            lines = [
+                "",
+                "═══════════════════════════════════════════════════════════",
+                f"  TICK {self.day:3d}  [{reason}]  EPS={self.eps:.3f}    "
+                f"γ={self.gamma_live:.3f}  β_y={self.beta_y_live:.3f}",
+                "═══════════════════════════════════════════════════════════",
+                f"  Prediction market   HIKE={q_h:.3f}  HOLD={q_hold_:.3f}  CUT={q_c:.3f}",
+                f"  E[Δr] = {info['e_dr']:+6.2f} bps   Var[Δr] = {info['var_dr']:8.2f} bps²",
+                "",
+                f"  Stock C",
+                f"    market mid     {c_mid:8.2f}",
+                f"    fair value     {fv:8.2f}   (mispricing = {mis:+.2f})",
+                f"    model breakdown: ops={info['ops']:+.3f}  bonds={info['bonds']:+.3f}",
+                f"    signal         {signal}",
+                "",
+                f"  Sensitivities (per share of C)",
+                f"    dP/dy        = {dpdy:+9.2f}  $/unit-yield",
+                f"                 = {dpdy_bp:+9.4f}  $/bp",
+                f"      ops channel  = {info['dpdy_ops']:+9.2f}",
+                f"      bonds channel= {info['dpdy_bonds']:+9.2f}",
+                f"    d²P/dy²      = {info['gpdy']:+9.2f}  (convexity)",
+                "",
+                f"  Hedge guide — neutralize ±25bps scenarios in prob market",
+                f"   (solved 2x2: long N_H HIKE + long N_C CUT)",
+                f"    if LONG  {HEDGE_LOT} C : HIKE {hike_long:+d}   CUT {cut_long:+d}",
+                f"    if SHORT {HEDGE_LOT} C : HIKE {hike_short:+d}   CUT {cut_short:+d}",
+                live_line,
+                "═══════════════════════════════════════════════════════════",
+                "",
+            ]
+            print("\n".join(lines))
+
+            # keep the calibration pipeline fed so gamma/beta_y stay live
+            self.store.record(time.time(), c_mid, q_h, q_hold_, q_c, self.eps)
+            self._calibrate()
+
+        async def bot_handle_book_update(self, symbol: str) -> None:
+            if symbol in WATCHED_SYMS:
+                await self._maybe_print(reason=f"book:{symbol}")
 
         async def bot_handle_order_fill(self, order_id, qty, price):
+            # user is trading manually; just log fills for visibility
             info = self.open_orders.get(order_id)
             if not info:
                 return
-
             is_buy = info[0].side == utc_pb2.NewOrderRequest.Side.BUY  # type: ignore[attr-defined]
-            signed = qty if is_buy else -qty
-
-            self.net_pos += signed
-            print(f"[FILL] pos={self.net_pos}")
+            side = "BUY " if is_buy else "SELL"
+            sym = info[0].symbol
+            print(f"[FILL] {sym} {side} {qty}@{price}")
 
         async def bot_handle_news(self, news_release: dict) -> None:
             data = news_release.get("new_data") or {}
             subtype = data.get("structured_subtype")
 
             if subtype == "earnings":
+                asset = str(data.get("asset", "")).upper()
+                if asset != SYMBOL:
+                    # earnings for A or B — ignore, we only model C
+                    print(f"[NEWS] {asset} EPS={data.get('value')} (ignored)")
+                    return
                 try:
                     self.eps = float(data["value"])
-                    print(f"[NEWS] EPS → {self.eps:.3f}")
+                    print(f"[NEWS] C EPS → {self.eps:.3f}")
                 except (TypeError, ValueError):
-                    pass
+                    return
+                await self._maybe_print(reason="C EPS news", force=True)
                 return
 
             if subtype == "cpi_print":
@@ -288,13 +315,43 @@ if __name__ == "__main__":
                     forecast = float(data["forecast"])
                 except (TypeError, ValueError, KeyError):
                     return
-                await self._cpi_trade(actual, forecast)
+                surprise = actual - forecast
+                tag = "HOT " if surprise > 0 else ("COLD" if surprise < 0 else "FLAT")
+                bias = (
+                    "buy HIKE / sell CUT" if surprise > 0
+                    else "sell HIKE / buy CUT" if surprise < 0
+                    else "no bias"
+                )
+                print(
+                    f"\n[CPI ALERT] {tag}  actual={actual:.4f}  forecast={forecast:.4f}  "
+                    f"surprise={surprise:+.4f}  →  {bias}\n"
+                )
+                await self._maybe_print(reason="CPI news", force=True)
+
+        def _calibrate(self):
+            if len(self.store.data) < CALIB_MIN_OBS:
+                return
+            r = calibrate_nonlinear(
+                self.store,
+                gamma_init=self.gamma_live,
+                beta_y_init=self.beta_y_live,
+            )
+            if r and r.get("converged"):
+                self.gamma_live = 0.5 * self.gamma_live + 0.5 * float(r["gamma"])
+                self.beta_y_live = 0.5 * self.beta_y_live + 0.5 * float(r["beta_y"])
+                print(
+                    f"[CALIB] gamma={self.gamma_live:.4f}  "
+                    f"beta_y={self.beta_y_live:.4f}  rmse={r['rmse']:.3f}  n={r['n_obs']}"
+                )
 
         async def _loop(self):
             await asyncio.sleep(5)
             while True:
-                await self._rebalance()
-                await asyncio.sleep(REBALANCE_SEC)
+                try:
+                    await self._maybe_print(reason="heartbeat", force=True)
+                except Exception as e:
+                    print(f"[PRINT ERR] {e}")
+                await asyncio.sleep(HEARTBEAT_SEC)
 
         async def start(self):
             asyncio.create_task(self._loop())
