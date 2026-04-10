@@ -15,7 +15,13 @@ lam = 0.65
 beta_y = 1.0
 gamma = 0.5
 
-MIN_HEDGE_THRESHOLD = 10
+# CPI-surprise → prob-market sizing buckets (|actual - forecast| in decimal)
+CPI_BUCKETS = [
+    (0.0005, 0),    # noise → no trade
+    (0.0015, 20),   # small surprise
+    (0.0030, 60),   # medium surprise
+    (float("inf"), 120),  # large surprise → full size
+]
 
 # ---- Core Functions ----
 
@@ -159,39 +165,51 @@ if __name__ == "__main__":
 
             return {"probs": probs, "fv": fv, "dpdy": dpdy}
 
-        async def _update_hedge(self):
-            pos_c = int(self.positions.get(SYMBOL, 0))
+        async def _cpi_trade(self, actual: float, forecast: float):
+            """
+            Crude CPI-surprise directional trade in the prob market.
+            Hot CPI (actual > forecast) → buy HIKE, sell CUT.
+            Cold CPI (actual < forecast) → sell HIKE, buy CUT.
+            Size by |surprise| via CPI_BUCKETS. Fires on every CPI print.
+            """
+            surprise = actual - forecast
+            mag = abs(surprise)
 
-            # ---- NO POSITION → NO HEDGE ----
-            if abs(pos_c) < MIN_HEDGE_THRESHOLD:
-                print("[HEDGE] flatten (no C position)")
-                await self._place_toward("R_HIKE", -int(self.positions.get("R_HIKE", 0)))
-                await self._place_toward("R_CUT", -int(self.positions.get("R_CUT", 0)))
+            # bucketed size (crude if-ladder)
+            size = 0
+            for thresh, sz in CPI_BUCKETS:
+                if mag < thresh:
+                    size = sz
+                    break
+
+            print(
+                f"[CPI] actual={actual:.4f} forecast={forecast:.4f} "
+                f"surprise={surprise:+.4f} → size={size}"
+            )
+
+            if size == 0:
                 return
 
-            info = self._fair_value()
-            if info is None:
-                return
-
-            q_h, q_hold_, q_c = info["probs"]
-
-            hike_pnl = pos_c * info["dpdy"] * 0.0025
-            cut_pnl = -hike_pnl
-
-            if q_hold_ > 1e-6:
-                det = q_hold_
-                N_h = (-(1 - q_c) * hike_pnl - q_c * cut_pnl) / det
-                N_c = (-(1 - q_h) * cut_pnl - q_h * hike_pnl) / det
+            # hot → long HIKE, short CUT.  cold → flip.
+            if surprise > 0:
+                target_hike, target_cut = +size, -size
             else:
-                N_h = N_c = 0
+                target_hike, target_cut = -size, +size
 
-            target_h = int(np.clip(round(N_h), -MAX_HEDGE_POS, MAX_HEDGE_POS))
-            target_c = int(np.clip(round(N_c), -MAX_HEDGE_POS, MAX_HEDGE_POS))
+            pos_h = int(self.positions.get("R_HIKE", 0))
+            pos_c = int(self.positions.get("R_CUT", 0))
 
-            print(f"[HEDGE UPDATE] pos_C={pos_c} → HIKE={target_h}, CUT={target_c}")
+            print(
+                f"[CPI TRADE] HIKE {pos_h:+d}→{target_hike:+d}   "
+                f"CUT {pos_c:+d}→{target_cut:+d}"
+            )
 
-            await self._place_toward("R_HIKE", target_h - int(self.positions.get("R_HIKE", 0)))
-            await self._place_toward("R_CUT", target_c - int(self.positions.get("R_CUT", 0)))
+            # fire both legs concurrently so we hit the book before the rest of the
+            # market re-prices on the same print
+            await asyncio.gather(
+                self._place_toward("R_HIKE", target_hike - pos_h),
+                self._place_toward("R_CUT", target_cut - pos_c),
+            )
 
         async def _place_toward(self, symbol, delta):
             if abs(delta) < 1:
@@ -252,8 +270,25 @@ if __name__ == "__main__":
             self.net_pos += signed
             print(f"[FILL] pos={self.net_pos}")
 
-            # ---- CRITICAL: hedge after fills ----
-            await self._update_hedge()
+        async def bot_handle_news(self, news_release: dict) -> None:
+            data = news_release.get("new_data") or {}
+            subtype = data.get("structured_subtype")
+
+            if subtype == "earnings":
+                try:
+                    self.eps = float(data["value"])
+                    print(f"[NEWS] EPS → {self.eps:.3f}")
+                except (TypeError, ValueError):
+                    pass
+                return
+
+            if subtype == "cpi_print":
+                try:
+                    actual = float(data["actual"])
+                    forecast = float(data["forecast"])
+                except (TypeError, ValueError, KeyError):
+                    return
+                await self._cpi_trade(actual, forecast)
 
         async def _loop(self):
             await asyncio.sleep(5)
