@@ -17,7 +17,7 @@ class EqualWeightStrategy(StrategyBase):
 
 
 class VolManagedEqualWeightStrategy(StrategyBase):
-    """Long-only inverse-vol weights from recent daily log returns (competition-style signal)."""
+    """Long-only inverse-vol weights from recent daily log returns."""
 
     VOL_WIN = 21
 

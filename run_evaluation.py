@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare strategies on competition-style splits (single 4y/1y or time-series CV).
+"""Compare strategies on standard splits (single 4y/1y or time-series CV).
 
 Usage:
   python run_evaluation.py --data-dir "/path/to/participant folder"
@@ -119,7 +119,7 @@ def run_cv(data_dir: str, strategies: dict[str, callable]) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(description="Evaluate portfolio strategies (competition harness)")
+    p = argparse.ArgumentParser(description="Evaluate portfolio strategies (local harness)")
     p.add_argument(
         "--data-dir",
         required=True,

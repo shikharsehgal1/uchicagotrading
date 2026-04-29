@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a fixed ablation / stress batch on time-series CV (competition harness).
+"""Run a fixed ablation / stress batch on time-series CV (local harness).
 
 Priority encoded here (quant research view for a single hidden OOS year):
   1) Robust CV: mean(fold Sharpe) - 0.5 * std(fold Sharpe)

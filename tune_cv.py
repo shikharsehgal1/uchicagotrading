@@ -217,7 +217,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if baseline_row is not None and robust_score(best) > robust_score(baseline_row) + 1e-6:
         print(
-            "\nSuggested: update class defaults in case2.py to the RECOMMENDED params "
+            "\nSuggested: update class defaults in the strategy file to the RECOMMENDED params "
             "(or keep as create_strategy_with_params for experiments)."
         )
     else:

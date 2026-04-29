@@ -1,6 +1,4 @@
 """Competition-aligned backtest harness (tick-level PnL, borrow, transaction costs).
-
-Mirrors the reference ``validate.py`` mechanics so local results match the case.
 """
 
 from __future__ import annotations
